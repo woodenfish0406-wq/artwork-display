@@ -124,6 +124,18 @@ def compute_corners(tl, tr, aspect):
     return [tl, tr, (x2+px, y2+py), (x1+px, y1+py)]
 
 
+def apply_adjustments(base_corners, dx, dy, scale_pct):
+    """對 base_corners 套用左右/上下偏移和大小縮放，回傳調整後的 4 個角落"""
+    scale = scale_pct / 100.0
+    cx = sum(p[0] for p in base_corners) / 4
+    cy = sum(p[1] for p in base_corners) / 4
+    return [
+        (cx + (x - cx) * scale + dx,
+         cy + (y - cy) * scale + dy)
+        for x, y in base_corners
+    ]
+
+
 def draw_corners(img_pil, corners, disp_scale):
     """在顯示圖上畫出角落標記和四邊形輪廓"""
     overlay = img_pil.copy().convert("RGB")
@@ -160,7 +172,7 @@ if not catalog:
     st.stop()
 
 # ── Session state 初始化 ──
-for key, val in [("corners", []), ("last_click", None),
+for key, val in [("base_corners", []), ("last_click", None),
                  ("result_img", None), ("art_key", "")]:
     if key not in st.session_state:
         st.session_state[key] = val
@@ -182,10 +194,12 @@ with st.sidebar:
     # 切換字畫時自動重置
     art_key = f"{category}/{art_idx}"
     if st.session_state.art_key != art_key:
-        st.session_state.art_key    = art_key
-        st.session_state.corners    = []
-        st.session_state.last_click = None
-        st.session_state.result_img = None
+        st.session_state.art_key      = art_key
+        st.session_state.base_corners = []
+        st.session_state.last_click   = None
+        st.session_state.result_img   = None
+        for k in ("adj_dx", "adj_dy", "adj_scale"):
+            st.session_state.pop(k, None)
 
     if art_path.exists():
         thumb = Image.open(art_path)
@@ -196,9 +210,11 @@ with st.sidebar:
 
     st.divider()
     if st.button("重新選取位置", use_container_width=True):
-        st.session_state.corners    = []
-        st.session_state.last_click = None
-        st.session_state.result_img = None
+        st.session_state.base_corners = []
+        st.session_state.last_click   = None
+        st.session_state.result_img   = None
+        for k in ("adj_dx", "adj_dy", "adj_scale"):
+            st.session_state.pop(k, None)
         st.rerun()
 
 # ── 主區域 ────────────────────────────────────────────────
@@ -236,25 +252,30 @@ else:
 # 互動點選區
 st.subheader("步驟 2：點選字畫位置")
 
-n = len(st.session_state.corners)
+n = len(st.session_state.base_corners)
 if n == 0:
     st.info("在圖片上點選字畫的 **左上角**")
 elif n == 1:
     st.info("再點選字畫的 **右上角**（下方兩角自動依比例產生）")
 elif n == 4:
-    st.success("位置已設定，可合成或繼續微調")
+    st.success("位置已設定，用下方滑桿微調後按「開始合成」")
 
 # 顯示比例（原圖縮小到最多 900px 寬供操作）
-MAX_W     = 900
-rw, rh    = room_img.size
+MAX_W      = 900
+rw, rh     = room_img.size
 disp_scale = min(MAX_W / rw, 1.0)
-disp_w    = int(rw * disp_scale)
-disp_h    = int(rh * disp_scale)
-disp_img  = room_img.resize((disp_w, disp_h), Image.LANCZOS)
+disp_img   = room_img.resize((int(rw * disp_scale), int(rh * disp_scale)), Image.LANCZOS)
 
-# 疊加角落標記
-if st.session_state.corners:
-    disp_img = draw_corners(disp_img, st.session_state.corners, disp_scale)
+# 套用滑桿調整，取得實際使用的 corners
+adj_corners = None
+if len(st.session_state.base_corners) == 4:
+    dx    = st.session_state.get("adj_dx", 0)
+    dy    = st.session_state.get("adj_dy", 0)
+    scale = st.session_state.get("adj_scale", 100)
+    adj_corners = apply_adjustments(st.session_state.base_corners, dx, dy, scale)
+    disp_img = draw_corners(disp_img, adj_corners, disp_scale)
+elif st.session_state.base_corners:
+    disp_img = draw_corners(disp_img, st.session_state.base_corners, disp_scale)
 
 # 圖片點選元件
 click = streamlit_image_coordinates(disp_img, key="room_click")
@@ -265,46 +286,49 @@ if click is not None:
         st.session_state.last_click = pos
         x_orig = int(click["x"] / disp_scale)
         y_orig = int(click["y"] / disp_scale)
-        n = len(st.session_state.corners)
+        n = len(st.session_state.base_corners)
 
         if n == 0:
-            st.session_state.corners = [(x_orig, y_orig)]
+            st.session_state.base_corners = [(x_orig, y_orig)]
         elif n == 1:
-            full = compute_corners(st.session_state.corners[0], (x_orig, y_orig), aspect)
+            full = compute_corners(st.session_state.base_corners[0], (x_orig, y_orig), aspect)
             if full:
-                st.session_state.corners    = full
-                st.session_state.result_img = None
+                st.session_state.base_corners = full
+                st.session_state.result_img   = None
+                for k in ("adj_dx", "adj_dy", "adj_scale"):
+                    st.session_state.pop(k, None)
         else:
             # 再點一下重置
-            st.session_state.corners    = [(x_orig, y_orig)]
-            st.session_state.result_img = None
+            st.session_state.base_corners = [(x_orig, y_orig)]
+            st.session_state.result_img   = None
+            for k in ("adj_dx", "adj_dy", "adj_scale"):
+                st.session_state.pop(k, None)
         st.rerun()
 
-# 微調數值輸入
-if len(st.session_state.corners) == 4:
-    with st.expander("微調角落座標（可選）"):
-        labels = ["左上", "右上", "右下", "左下"]
-        new_corners = []
-        cols = st.columns(4)
-        for i, label in enumerate(labels):
-            cx, cy = st.session_state.corners[i]
-            with cols[i]:
-                nx = st.number_input(f"{label} X", value=int(cx), step=5, key=f"x{i}")
-                ny = st.number_input(f"{label} Y", value=int(cy), step=5, key=f"y{i}")
-                new_corners.append((nx, ny))
-        if st.button("套用微調"):
-            st.session_state.corners    = new_corners
-            st.session_state.result_img = None
-            st.rerun()
+# 滑桿微調（4 個角落已設定才顯示）
+if len(st.session_state.base_corners) == 4:
+    st.markdown("**微調位置與大小**")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.slider("左右移動", -300, 300, 0, step=5, key="adj_dx",
+                  help="正值向右，負值向左")
+    with c2:
+        st.slider("上下移動", -300, 300, 0, step=5, key="adj_dy",
+                  help="正值向下，負值向上")
+    with c3:
+        st.slider("大小 (%)", 50, 200, 100, step=5, key="adj_scale",
+                  help="100 為原始大小")
 
     # 合成按鈕
     st.divider()
     if st.button("開始合成", type="primary", use_container_width=True):
         if art_pil is None:
             st.error("找不到字畫檔案")
+        elif adj_corners is None:
+            st.error("請先設定位置")
         else:
             with st.spinner("合成中，請稍候..."):
-                result = composite_artwork(room_img, art_pil, st.session_state.corners)
+                result = composite_artwork(room_img, art_pil, adj_corners)
                 st.session_state.result_img = result
 
 # 顯示結果
