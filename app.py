@@ -124,6 +124,15 @@ def compute_corners(tl, tr, aspect):
     return [tl, tr, (x2+px, y2+py), (x1+px, y1+py)]
 
 
+_SLIDER_KEYS = ["adj_dx", "adj_dy", "adj_scale",
+                "c0_dx", "c0_dy", "c1_dx", "c1_dy",
+                "c2_dx", "c2_dy", "c3_dx", "c3_dy"]
+
+def _reset_sliders():
+    for k in _SLIDER_KEYS:
+        st.session_state.pop(k, None)
+
+
 def apply_adjustments(base_corners, dx, dy, scale_pct):
     """對 base_corners 套用左右/上下偏移和大小縮放，回傳調整後的 4 個角落"""
     scale = scale_pct / 100.0
@@ -198,8 +207,7 @@ with st.sidebar:
         st.session_state.base_corners = []
         st.session_state.last_click   = None
         st.session_state.result_img   = None
-        for k in ("adj_dx", "adj_dy", "adj_scale"):
-            st.session_state.pop(k, None)
+        _reset_sliders()
 
     if art_path.exists():
         thumb = Image.open(art_path)
@@ -213,8 +221,7 @@ with st.sidebar:
         st.session_state.base_corners = []
         st.session_state.last_click   = None
         st.session_state.result_img   = None
-        for k in ("adj_dx", "adj_dy", "adj_scale"):
-            st.session_state.pop(k, None)
+        _reset_sliders()
         st.rerun()
 
 # ── 主區域 ────────────────────────────────────────────────
@@ -267,13 +274,22 @@ disp_scale = min(MAX_W / rw, 1.0)
 disp_img   = room_img.resize((int(rw * disp_scale), int(rh * disp_scale)), Image.LANCZOS)
 
 # 套用滑桿調整，取得實際使用的 corners
-adj_corners = None
+final_corners = None
 if len(st.session_state.base_corners) == 4:
-    dx    = st.session_state.get("adj_dx", 0)
-    dy    = st.session_state.get("adj_dy", 0)
-    scale = st.session_state.get("adj_scale", 100)
-    adj_corners = apply_adjustments(st.session_state.base_corners, dx, dy, scale)
-    disp_img = draw_corners(disp_img, adj_corners, disp_scale)
+    # 整體調整
+    overall = apply_adjustments(
+        st.session_state.base_corners,
+        st.session_state.get("adj_dx", 0),
+        st.session_state.get("adj_dy", 0),
+        st.session_state.get("adj_scale", 100),
+    )
+    # 個別角落偏移（疊加在整體調整上）
+    final_corners = [
+        (x + st.session_state.get(f"c{i}_dx", 0),
+         y + st.session_state.get(f"c{i}_dy", 0))
+        for i, (x, y) in enumerate(overall)
+    ]
+    disp_img = draw_corners(disp_img, final_corners, disp_scale)
 elif st.session_state.base_corners:
     disp_img = draw_corners(disp_img, st.session_state.base_corners, disp_scale)
 
@@ -295,40 +311,55 @@ if click is not None:
             if full:
                 st.session_state.base_corners = full
                 st.session_state.result_img   = None
-                for k in ("adj_dx", "adj_dy", "adj_scale"):
-                    st.session_state.pop(k, None)
+                _reset_sliders()
         else:
             # 再點一下重置
             st.session_state.base_corners = [(x_orig, y_orig)]
             st.session_state.result_img   = None
-            for k in ("adj_dx", "adj_dy", "adj_scale"):
-                st.session_state.pop(k, None)
+            _reset_sliders()
         st.rerun()
 
 # 滑桿微調（4 個角落已設定才顯示）
 if len(st.session_state.base_corners) == 4:
-    st.markdown("**微調位置與大小**")
-    c1, c2, c3 = st.columns(3)
-    with c1:
+
+    # ── 整體調整 ──────────────────────────────────────────
+    st.markdown("**整體調整**")
+    g1, g2, g3 = st.columns(3)
+    with g1:
         st.slider("左右移動", -300, 300, 0, step=5, key="adj_dx",
-                  help="正值向右，負值向左")
-    with c2:
+                  help="整體向左／向右平移")
+    with g2:
         st.slider("上下移動", -300, 300, 0, step=5, key="adj_dy",
-                  help="正值向下，負值向上")
-    with c3:
+                  help="整體向上／向下平移")
+    with g3:
         st.slider("大小 (%)", 50, 200, 100, step=5, key="adj_scale",
-                  help="100 為原始大小")
+                  help="100 為原始大小，縮小或放大整幅字畫")
+
+    # ── 個別角落微調 ──────────────────────────────────────
+    with st.expander("個別角落微調（透視校正）"):
+        st.caption("可單獨移動某個角落，修正牆面透視變形")
+        corner_labels = ["① 左上", "② 右上", "③ 右下", "④ 左下"]
+        cols = st.columns(4)
+        for i, label in enumerate(corner_labels):
+            with cols[i]:
+                st.markdown(f"**{label}**")
+                st.slider("← →", -150, 150, 0, step=3,
+                          key=f"c{i}_dx", label_visibility="collapsed",
+                          help=f"{label} 左右移動")
+                st.slider("↑ ↓", -150, 150, 0, step=3,
+                          key=f"c{i}_dy", label_visibility="collapsed",
+                          help=f"{label} 上下移動")
 
     # 合成按鈕
     st.divider()
     if st.button("開始合成", type="primary", use_container_width=True):
         if art_pil is None:
             st.error("找不到字畫檔案")
-        elif adj_corners is None:
+        elif final_corners is None:
             st.error("請先設定位置")
         else:
             with st.spinner("合成中，請稍候..."):
-                result = composite_artwork(room_img, art_pil, adj_corners)
+                result = composite_artwork(room_img, art_pil, final_corners)
                 st.session_state.result_img = result
 
 # 顯示結果
