@@ -54,7 +54,10 @@ def build_mounted_artwork(artwork_pil, frame_ratio=0.07):
     return mounted, frame_mask, art_mask, (tw, th)
 
 
-def composite_artwork(room_pil, artwork_pil, wall_pts):
+def composite_artwork(room_pil, artwork_pil, wall_pts, blend=0.45):
+    """
+    blend: 光影融入強度 0.0（直接貼上）→ 1.0（完全跟隨牆面光影）
+    """
     room = room_pil.copy()
     rw, rh = room.size
 
@@ -72,25 +75,59 @@ def composite_artwork(room_pil, artwork_pil, wall_pts):
     M   = cv2.getPerspectiveTransform(src, dst)
 
     warped = cv2.warpPerspective(mounted, M, (rw, rh),
-        flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT, borderValue=(255,255,255))
+        flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(255, 255, 255))
 
     all_mask = np.clip(
-        frame_mask.astype(np.int32) + art_mask.astype(np.int32), 0, 255).astype(np.uint8)
+        frame_mask.astype(np.int32) + art_mask.astype(np.int32), 0, 255
+    ).astype(np.uint8)
     warped_mask = cv2.warpPerspective(all_mask, M, (rw, rh),
         flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
     inside = (warped_mask > 128).astype(np.float32)
-    in3    = np.stack([inside]*3, axis=2)
-    room_f = np.array(room).astype(np.float32)
-    result = room_f * (1 - in3) + warped.astype(np.float32) * in3
+    in3    = np.stack([inside] * 3, axis=2)
+    room_f  = np.array(room).astype(np.float32)
+    warped_f = warped.astype(np.float32)
 
-    shift    = max(5, int(min(rw, rh) * 0.005))
-    shadow   = cv2.GaussianBlur(warped_mask, (0,0), sigmaX=shift*1.5)
-    shadow_s = np.zeros_like(shadow)
-    shadow_s[shift:, shift:] = shadow[:-shift, :-shift]
+    # ── 光影融合 ──────────────────────────────────────────
+    # 牆面亮度圖（0–1）
+    wall_lum = (0.299 * room_f[..., 0] +
+                0.587 * room_f[..., 1] +
+                0.114 * room_f[..., 2]) / 255.0
+
+    # 字畫區域的牆面平均亮度（作為基準）
+    mask_bool = inside > 0.5
+    avg_lum   = float(np.mean(wall_lum[mask_bool])) if mask_bool.any() else 0.78
+    avg_lum   = max(avg_lum, 0.1)
+
+    # 亮度調整因子：讓字畫跟隨牆面明暗分布
+    lum_factor = wall_lum / avg_lum
+    lum_factor = cv2.GaussianBlur(lum_factor.astype(np.float32), (0, 0), sigmaX=60)
+    lum_factor = np.clip(lum_factor, 0.55, 1.45)
+    lum3 = np.stack([lum_factor] * 3, axis=2)
+
+    # 光影版字畫 = 字畫顏色 × 牆面亮度因子
+    warped_lit = np.clip(warped_f * lum3, 0, 255)
+
+    # 混合：直接貼上（清晰）+ 光影版（融入感）
+    warped_blend = warped_f * (1 - blend) + warped_lit * blend
+
+    # 合成
+    result = room_f * (1 - in3) + warped_blend * in3
+
+    # ── 暖色立體陰影 ─────────────────────────────────────
+    shift  = max(8, int(min(rw, rh) * 0.007))
+    sigma  = shift * 2.2
+    shadow_raw = cv2.GaussianBlur(warped_mask.astype(np.float32), (0, 0), sigmaX=sigma)
+    shadow_s   = np.zeros_like(shadow_raw)
+    shadow_s[shift:, shift:] = shadow_raw[:-shift, :-shift]
     shadow_s[warped_mask > 64] = 0
-    sm3 = np.stack([shadow_s]*3, axis=2).astype(np.float32) / 255.0 * 0.35
-    result = result * (1 - sm3)
+    alpha = shadow_s / 255.0 * 0.50
+
+    # 深棕暖色陰影（R 保留最多 → 棕色調）
+    result[..., 0] = np.clip(result[..., 0] * (1 - alpha * 0.70), 0, 255)
+    result[..., 1] = np.clip(result[..., 1] * (1 - alpha * 0.85), 0, 255)
+    result[..., 2] = np.clip(result[..., 2] * (1 - alpha * 1.00), 0, 255)
 
     return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8), 'RGB')
 
@@ -124,7 +161,7 @@ def compute_corners(tl, tr, aspect):
     return [tl, tr, (x2+px, y2+py), (x1+px, y1+py)]
 
 
-_SLIDER_KEYS = ["adj_dx", "adj_dy", "adj_scale",
+_SLIDER_KEYS = ["adj_dx", "adj_dy", "adj_scale", "adj_blend",
                 "c0_dx", "c0_dy", "c1_dx", "c1_dy",
                 "c2_dx", "c2_dy", "c3_dx", "c3_dy"]
 
@@ -324,7 +361,7 @@ if len(st.session_state.base_corners) == 4:
 
     # ── 整體調整 ──────────────────────────────────────────
     st.markdown("**整體調整**")
-    g1, g2, g3 = st.columns(3)
+    g1, g2, g3, g4 = st.columns(4)
     with g1:
         st.slider("左右移動", -300, 300, 0, step=5, key="adj_dx",
                   help="整體向左／向右平移")
@@ -333,7 +370,10 @@ if len(st.session_state.base_corners) == 4:
                   help="整體向上／向下平移")
     with g3:
         st.slider("大小 (%)", 50, 200, 100, step=5, key="adj_scale",
-                  help="100 為原始大小，縮小或放大整幅字畫")
+                  help="100 為原始大小")
+    with g4:
+        st.slider("光影融入 (%)", 0, 100, 45, step=5, key="adj_blend",
+                  help="0=直接貼上  100=完全跟隨牆面光影")
 
     # ── 個別角落微調 ──────────────────────────────────────
     with st.expander("個別角落微調（透視校正）"):
@@ -359,7 +399,9 @@ if len(st.session_state.base_corners) == 4:
             st.error("請先設定位置")
         else:
             with st.spinner("合成中，請稍候..."):
-                result = composite_artwork(room_img, art_pil, final_corners)
+                blend_val = st.session_state.get("adj_blend", 45) / 100.0
+                result = composite_artwork(room_img, art_pil, final_corners,
+                                           blend=blend_val)
                 st.session_state.result_img = result
 
 # 顯示結果
