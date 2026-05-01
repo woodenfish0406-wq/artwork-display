@@ -1,0 +1,19 @@
+# 原始大圖（太大，不上傳）
+artworks/
+artworks_nobg/
+
+# PyInstaller 產物
+build/
+dist/
+*.spec
+分享套件/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# 系統
+.DS_Store
+Thumbs.db
